@@ -1,0 +1,11 @@
+date,duration_minutes,learning_resources,learning_location,interruptions,subject
+2026-09-14,60,Skriptum; Übungsblatt,Bibliothek,0,Mathematik für Computer Science 1
+2026-09-14,45,Vorlesungsfolien; eigene Notizen,Zuhause,1,Einführung in die Wirtschaftsinformatik
+2026-09-15,90,IntelliJ IDEA; Java-Übungsaufgaben,Computerlabor,1,Strukturierte Programmierung
+2026-09-16,50,Skriptum; Buchungsbeispiele,Zuhause,2,Rechnungswesen
+2026-09-17,75,Vorlesungsfolien; Gruppenarbeit,Gruppenlernraum,1,Einführung in Software Engineering
+2026-09-18,40,Karteikarten; eigene Notizen,Zug,3,Unternehmensführung
+2026-09-19,80,Skriptum; SQL-Übungsaufgaben,Bibliothek,0,Datenmanagement
+2026-09-20,35,Vokabelkarten; Fachartikel,Zuhause,0,Technical English 1
+2026-09-21,65,YouTube; Übungsblatt,Zuhause,2,Mathematik für Computer Science 1
+2026-09-22,55,Skriptum; Übungsaufgaben,Bibliothek,1,Rechnungswesen
