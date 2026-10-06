@@ -1,0 +1,32 @@
+# Learno runtime/user data
+data/
+uploads/
+instance/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test / tooling cache
+.pytest_cache/
+.coverage
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

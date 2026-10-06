@@ -1,0 +1,26 @@
+# FH-Unterlagen nicht auf GitHub
+FH_Material/
+
+# Lokale Learno-Daten
+learno/data/
+learno/uploads/
+learno/instance/
+
+# Python / Entwicklungsdateien
+learno/__pycache__/
+learno/.vscode/
+learno/.venv/
+learno/venv/
+*.pyc
+.pytest_cache/
+
+# Datenbanken und Secrets
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+
+# Sonstiges
+*.log
+Thumbs.db
