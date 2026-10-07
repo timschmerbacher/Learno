@@ -13,9 +13,12 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, parse_qs
 from contextlib import contextmanager
-import groups
+import v2
+import insights
+import feedback
+from migrate import ready
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('LEARNO_DB', str(ROOT / 'data' / 'learno.db')))
@@ -24,7 +27,7 @@ PASSWORD_ROUNDS = 260000
 
 @contextmanager
 def connect():
-    db = sqlite3.connect(DB, timeout=15)
+    db = sqlite3.connect(DB.resolve().as_uri() + '?mode=rw', uri=True, timeout=15)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
     try:
@@ -35,39 +38,12 @@ def connect():
 
 
 def init_db():
-    DB.parent.mkdir(parents=True, exist_ok=True)
+    """Read-only readiness check. Migration is deliberately never run at startup."""
+    if not DB.exists():
+        raise RuntimeError('Datenbank fehlt. Zuerst python migrate.py --workers-stopped ausführen.')
     with connect() as db:
-        db.executescript('''
-        CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE,
-          salt TEXT NOT NULL, password TEXT NOT NULL, reminder TEXT DEFAULT '18:00',
-          reminder_on INTEGER DEFAULT 0, timezone TEXT DEFAULT 'Europe/Vienna');
-        CREATE TABLE IF NOT EXISTS exams (
-          id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
-          title TEXT NOT NULL, subject TEXT NOT NULL, exam_date TEXT NOT NULL,
-          difficulty INTEGER NOT NULL, grade INTEGER, completed INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS sessions (
-          id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
-          exam_id INTEGER REFERENCES exams(id), subject TEXT NOT NULL,
-          date TEXT NOT NULL, seconds REAL NOT NULL, resources TEXT NOT NULL,
-          location TEXT NOT NULL, interruptions INTEGER DEFAULT 0,
-          public INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS active (
-          user_id INTEGER PRIMARY KEY REFERENCES users(id), exam_id INTEGER REFERENCES exams(id),
-          subject TEXT NOT NULL, started REAL NOT NULL, paused REAL,
-          paused_total REAL DEFAULT 0, interruptions INTEGER DEFAULT 0, date TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS friendships (
-          sender INTEGER REFERENCES users(id), receiver INTEGER REFERENCES users(id),
-          accepted INTEGER DEFAULT 0, PRIMARY KEY(sender, receiver));
-        CREATE TABLE IF NOT EXISTS posts (
-          id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
-          text TEXT NOT NULL, subject TEXT NOT NULL, title TEXT NOT NULL,
-          seconds REAL NOT NULL, grade INTEGER, created TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS comments (
-          id INTEGER PRIMARY KEY, post_id INTEGER REFERENCES posts(id),
-          user_id INTEGER REFERENCES users(id), text TEXT NOT NULL, created TEXT NOT NULL);
-        ''')
-        groups.migrate(db)
+        if not ready(db):
+            raise RuntimeError('Migration erforderlich. App stoppen und python migrate.py --workers-stopped ausführen.')
 
 
 def required(data, key, limit=120):
@@ -116,7 +92,7 @@ def rows(db, sql, args=()):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Keine Formularinhalte oder Passwörter protokollieren.
-        if not self.path.startswith('/api/state'):
+        if not self.path.startswith(('/api/state','/api/v2/state')):
             super().log_message(fmt, *args)
 
     def send(self, status, body, content_type='application/json; charset=utf-8', cookie=None, attachment=None):
@@ -153,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        static = {'/': ('index.html', 'text/html'), '/app.js': ('app.js', 'text/javascript'), '/style.css': ('style.css', 'text/css'), '/groups.js': ('groups.js', 'text/javascript')}
+        static = {'/': ('index.html', 'text/html'), '/app.js': ('app.js', 'text/javascript'), '/style.css': ('style.css', 'text/css'), '/v2.js': ('v2.js', 'text/javascript'), '/ui.js': ('ui.js', 'text/javascript')}
         if path in static:
             filename, kind = static[path]
             return self.send(200, (ROOT / 'static' / filename).read_bytes(), kind + '; charset=utf-8')
@@ -162,38 +138,38 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(401, {'error': 'Bitte anmelden.'})
         uid = identity['user_id']
         with connect() as db:
-            if path.startswith('/api/files/'):
+            if path in ('/api/v2/feed','/api/v2/notices','/api/v2/statistics','/api/v2/feedback'):
+                db.execute('BEGIN')
+                query=parse_qs(urlparse(self.path).query,keep_blank_values=True)
                 try:
-                    file=groups.get_file(db,int(path.rsplit('/',1)[1]),uid)
+                    result=feedback.listing(db,uid,query) if path.endswith('/feedback') else insights.feed(db,uid,query) if path.endswith('/feed') else insights.notices(db,uid,query) if path.endswith('/notices') else insights.statistics(db,uid)
+                    return self.send(200,result)
+                except feedback.Forbidden as error:
+                    return self.send(403,{'error':str(error)})
+                except ValueError as error:
+                    return self.send(400,{'error':str(error)})
+            if path.startswith('/api/v2/files/') or path.startswith('/api/files/'):
+                try:
+                    fid=int(path.rsplit('/',1)[1])
+                    if not 1<=fid<=9223372036854775807: raise ValueError('Ungültige Datei-ID.')
+                    if not path.startswith('/api/v2/'):
+                        old=db.execute('SELECT id FROM exam_attachments WHERE legacy_file_id=?',(fid,)).fetchone()
+                        if not old: raise ValueError('Datei nicht gefunden.')
+                        fid=old['id']
+                    file=v2.get_file(db,fid,uid)
                     return self.send(200,file['content'],file['mime'],attachment=file['filename'])
                 except (ValueError,TypeError):
                     return self.send(404,{'error':'Datei nicht gefunden oder kein Zugriff.'})
-            if path == '/api/state':
+            if path in ('/api/v2/state','/api/state'):
+                db.execute('BEGIN')  # Consistent snapshot across events, progress, feed and membership.
                 user = dict(db.execute('SELECT id,username,reminder,reminder_on,timezone FROM users WHERE id=?', (uid,)).fetchone())
-                sessions = rows(db, 'SELECT * FROM sessions WHERE user_id=? ORDER BY date DESC,id DESC', (uid,))
-                exams = rows(db, 'SELECT * FROM exams WHERE user_id=? ORDER BY exam_date,id', (uid,))
-                for exam in exams:
-                    exam['seconds'] = sum(s['seconds'] for s in sessions if s['exam_id'] == exam['id'])
-                    exam['priority'] = priority(exam, exam['seconds'] / 60)
-                active = db.execute('SELECT * FROM active WHERE user_id=?', (uid,)).fetchone()
-                active = dict(active) if active else None
-                if active:
-                    active['elapsed'] = max(0, (active['paused'] or time.time()) - active['started'] - active['paused_total'])
-                friends = rows(db, '''SELECT f.*, a.username AS sender_name,b.username AS receiver_name
-                    FROM friendships f JOIN users a ON a.id=f.sender JOIN users b ON b.id=f.receiver
-                    WHERE sender=? OR receiver=?''', (uid, uid))
-                posts = rows(db, '''SELECT p.*,u.username FROM posts p JOIN users u ON u.id=p.user_id ORDER BY p.id DESC LIMIT 200''')
-                comments = rows(db, '''SELECT c.*,u.username FROM comments c JOIN users u ON u.id=c.user_id
-                    WHERE c.post_id IN (SELECT id FROM posts ORDER BY id DESC LIMIT 200) ORDER BY c.id''')
+                friends = rows(db, 'SELECT f.*, a.username AS sender_name,b.username AS receiver_name\n                    FROM friendships f JOIN users a ON a.id=f.sender JOIN users b ON b.id=f.receiver\n                    WHERE sender=? OR receiver=?', (uid, uid))
                 monday = date.today() - timedelta(days=date.today().weekday())
-                ranking = rows(db, '''SELECT u.id,u.username,SUM(s.seconds) AS seconds FROM sessions s
-                    JOIN users u ON u.id=s.user_id WHERE s.public=1 AND s.date>=? AND s.date<=?
-                    GROUP BY u.id ORDER BY seconds DESC,u.username COLLATE NOCASE ASC LIMIT 100''',
+                ranking = rows(db, 'SELECT u.id,u.username,SUM(s.seconds) AS seconds FROM sessions s\n                    JOIN users u ON u.id=s.user_id WHERE s.public=1 AND s.date>=? AND s.date<=?\n                    GROUP BY u.id ORDER BY seconds DESC,u.username COLLATE NOCASE ASC LIMIT 100',
                     (monday.isoformat(), (monday + timedelta(days=6)).isoformat()))
-                return self.send(200, {'user': user, 'csrf': identity['csrf'], 'sessions': sessions, 'exams': exams,
-                    'active': active, 'friends': friends, 'posts': posts, 'comments': comments,
-                    'ranking': ranking, 'week_start': monday.isoformat(), **groups.state(db,uid)})
-            if path == '/api/export':
+                return self.send(200, {'user':user,'csrf':identity['csrf'],'friends':friends,
+                    'ranking':ranking,'week_start':monday.isoformat(),**v2.state(db,uid,priority),**feedback.status(db,uid)})
+            if path in ('/api/export','/api/v2/export'):
                 buffer = io.StringIO(newline='')
                 writer = csv.writer(buffer)
                 writer.writerow(['date','duration_minutes','learning_resources','learning_location','interruptions','subject'])
@@ -215,8 +191,11 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError('Ein JSON-Objekt wird erwartet.')
             path = urlparse(self.path).path
+            versioned=path.startswith('/api/v2/')
+            if versioned: path='/api/'+path.removeprefix('/api/v2/')
             result = {}
             with connect() as db:
+                db.execute('BEGIN IMMEDIATE')
                 if path in ('/api/register', '/api/login'):
                     # Persistentes Limit, auch über Worker-Neustarts hinweg.
                     bucket=hashlib.sha256((self.client_address[0]+path).encode()).hexdigest()
@@ -258,58 +237,14 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute('DELETE FROM auth_sessions WHERE token_hash=?',(identity['token_hash'],))
                     db.commit()
                     return self.send(200, {'ok':True}, cookie='learno=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0')
-                if path.removeprefix('/api/') in groups.ACTIONS:
-                    # Serialize group/file mutations so quota/adoption checks are atomic.
-                    db.execute('BEGIN IMMEDIATE')
-                    result=groups.handle(path.removeprefix('/api/'),db,uid,data,required,integer,iso_date,self.owned)
-                elif path == '/api/exam':
-                    result['id']=db.execute('INSERT INTO exams(user_id,title,subject,exam_date,difficulty) VALUES(?,?,?,?,?)',
-                        (uid, required(data,'title'),required(data,'subject'),iso_date(data.get('exam_date')),integer(data,'difficulty',1,5))).lastrowid
-                elif path == '/api/grade':
-                    exam_id = integer(data,'id',1,1000000000)
-                    self.owned(db,'exams',exam_id,uid)
-                    db.execute('UPDATE exams SET grade=?,completed=1 WHERE id=?', (integer(data,'grade',1,5),exam_id))
-                elif path == '/api/start':
-                    if db.execute('SELECT 1 FROM active WHERE user_id=?',(uid,)).fetchone():
-                        raise ValueError('Es läuft bereits eine Lernsession.')
-                    exam_id = data.get('exam_id') or None
-                    exam = self.owned(db,'exams',exam_id,uid) if exam_id else None
-                    if exam and exam['completed']:
-                        raise ValueError('Diese Prüfung wurde bereits abgeschlossen.')
-                    subject = exam['subject'] if exam else required(data,'subject')
-                    db.execute('INSERT INTO active(user_id,exam_id,subject,started,date) VALUES(?,?,?,?,?)',
-                        (uid,exam_id,subject,time.time(),iso_date(data.get('date'))))
-                elif path in ('/api/pause','/api/resume','/api/stop','/api/finish','/api/discard'):
-                    active = db.execute('SELECT * FROM active WHERE user_id=?',(uid,)).fetchone()
-                    if not active:
-                        raise ValueError('Keine laufende Lernsession vorhanden.')
-                    now = time.time()
-                    if path == '/api/pause' and active['paused'] is None:
-                        db.execute('UPDATE active SET paused=?,interruptions=interruptions+1 WHERE user_id=?',(now,uid))
-                    elif path == '/api/stop' and active['paused'] is None:
-                        db.execute('UPDATE active SET paused=? WHERE user_id=?',(now,uid))
-                    elif path == '/api/resume' and active['paused'] is not None:
-                        db.execute('UPDATE active SET paused_total=paused_total+?,paused=NULL WHERE user_id=?',(now-active['paused'],uid))
-                    elif path == '/api/finish':
-                        seconds = max(0.1, round((active['paused'] or now)-active['started']-active['paused_total'],1))
-                        db.execute('INSERT INTO sessions(user_id,exam_id,subject,date,seconds,resources,location,interruptions) VALUES(?,?,?,?,?,?,?,?)',
-                            (uid,active['exam_id'],active['subject'],active['date'],seconds,required(data,'resources',200),required(data,'location',120),active['interruptions']))
-                        db.execute('DELETE FROM active WHERE user_id=?',(uid,))
-                    elif path == '/api/discard':
-                        db.execute('DELETE FROM active WHERE user_id=?',(uid,))
-                elif path == '/api/session':
-                    exam_id = data.get('exam_id') or None
-                    exam = self.owned(db,'exams',exam_id,uid) if exam_id else None
-                    db.execute('INSERT INTO sessions(user_id,exam_id,subject,date,seconds,resources,location,interruptions) VALUES(?,?,?,?,?,?,?,?)',
-                        (uid,exam_id,exam['subject'] if exam else required(data,'subject'),iso_date(data.get('date')),
-                        integer(data,'duration_minutes',1,1440)*60,required(data,'resources',200),required(data,'location'),integer(data,'interruptions',0,1000)))
-                elif path == '/api/assign':
-                    sid = integer(data,'id',1,1000000000)
-                    session = self.owned(db,'sessions',sid,uid)
-                    exam = self.owned(db,'exams',integer(data,'exam_id',1,1000000000),uid)
-                    if exam['subject'].casefold() != session['subject'].casefold():
-                        raise ValueError('Lernsession und Prüfung müssen zum gleichen Fach gehören.')
-                    db.execute('UPDATE sessions SET exam_id=? WHERE id=?',(exam['id'],sid))
+                action=path.removeprefix('/api/')
+                if action in ('feedback','feedback-read'):
+                    if not versioned:return self.send(409,{'error':'Alte Schreibschnittstelle gesperrt.'})
+                    result=feedback.submit(db,uid,data,required) if action=='feedback' else feedback.mark_read(db,uid,data,integer)
+                elif action in v2.ACTIONS:
+                    if not versioned:
+                        return self.send(409,{'error':'Bitte die V2-Oberfläche neu laden. Alte Schreibschnittstelle gesperrt.'})
+                    result=v2.handle(action,db,uid,data,required,integer,iso_date,moderate)
                 elif path == '/api/import':
                     content = required(data,'csv',900000).lstrip('\ufeff')
                     reader = csv.DictReader(io.StringIO(content), strict=True)
@@ -330,32 +265,6 @@ class Handler(BaseHTTPRequestHandler):
                             raise ValueError('Maximal 5000 Zeilen pro Import.')
                     if not count:
                         raise ValueError('Die CSV-Datei enthält keine Datensätze.')
-                elif path == '/api/post':
-                    text = moderate(data.get('text',''))
-                    grade = None
-                    if data.get('session_id'):
-                        s = self.owned(db,'sessions',integer(data,'session_id',1,1000000000),uid)
-                        subject,title,seconds = s['subject'],'Lernsession',s['seconds']
-                        db.execute('UPDATE sessions SET public=1 WHERE id=?',(s['id'],))
-                    else:
-                        exam = self.owned(db,'exams',integer(data,'exam_id',1,1000000000),uid)
-                        if not exam['completed']:
-                            raise ValueError('Bitte die Prüfung zuerst mit einer Note abschließen.')
-                        subject,title,grade = exam['subject'],exam['title'],exam['grade']
-                        seconds = db.execute('SELECT COALESCE(SUM(seconds),0) FROM sessions WHERE exam_id=? AND user_id=?',(exam['id'],uid)).fetchone()[0]
-                        db.execute('UPDATE sessions SET public=1 WHERE exam_id=? AND user_id=?',(exam['id'],uid))
-                    db.execute('INSERT INTO posts(user_id,text,subject,title,seconds,grade,created) VALUES(?,?,?,?,?,?,?)',
-                        (uid,text,subject,title,seconds,grade,datetime.now(timezone.utc).isoformat()))
-                elif path == '/api/comment':
-                    post = db.execute('SELECT * FROM posts WHERE id=?',(integer(data,'post_id',1,1000000000),)).fetchone()
-                    if not post:
-                        raise ValueError('Beitrag nicht gefunden.')
-                    friend = db.execute('SELECT 1 FROM friendships WHERE accepted=1 AND ((sender=? AND receiver=?) OR (sender=? AND receiver=?))',
-                        (uid,post['user_id'],post['user_id'],uid)).fetchone()
-                    if post['user_id'] != uid and not friend:
-                        raise ValueError('Kommentare sind nur bei eigenen Beiträgen und bestätigten Freunden möglich.')
-                    text = moderate(required(data,'text',500))
-                    db.execute('INSERT INTO comments(post_id,user_id,text,created) VALUES(?,?,?,?)',(post['id'],uid,text,datetime.now(timezone.utc).isoformat()))
                 elif path == '/api/friend':
                     other = db.execute('SELECT id FROM users WHERE username=?',(required(data,'username',30),)).fetchone()
                     if not other or other['id'] == uid:
@@ -383,6 +292,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     return self.send(404, {'error':'Unbekannte Aktion.'})
             self.send(200, {'ok':True, **result})
+        except feedback.Forbidden as error:
+            self.send(403,{'error':str(error)})
+        except v2.Conflict as error:
+            self.send(409, {'error':str(error)})
         except (ValueError, TypeError, KeyError, csv.Error) as error:
             self.send(400, {'error':str(error) or 'Ungültige Eingabe.'})
         except sqlite3.Error:

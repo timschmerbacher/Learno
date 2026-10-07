@@ -5,6 +5,9 @@ FH_Material/
 learno/data/
 learno/uploads/
 learno/instance/
+learno/releases/
+# Lokales Betriebsprotokoll enthält Angaben zum echten Nutzerbestand
+learno/DEPLOYMENT_REPORT.md
 
 # Python / Entwicklungsdateien
 learno/__pycache__/
@@ -13,11 +16,15 @@ learno/.venv/
 learno/venv/
 *.pyc
 .pytest_cache/
+node_modules/
 
 # Datenbanken und Secrets
 *.db
 *.sqlite
 *.sqlite3
+*.db-*
+*.sqlite-*
+*.sqlite3-*
 .env
 .env.*
 

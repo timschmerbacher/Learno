@@ -8,7 +8,6 @@ import io
 import logging
 import app
 
-app.init_db()
 
 
 class WSGIHandler(app.Handler):
@@ -44,6 +43,7 @@ class WSGIHandler(app.Handler):
 def application(environ,start_response):
     handler=WSGIHandler(environ)
     try:
+        app.init_db()
         if handler.command in ('GET','HEAD'):
             handler.do_GET()
         elif handler.command=='POST':
